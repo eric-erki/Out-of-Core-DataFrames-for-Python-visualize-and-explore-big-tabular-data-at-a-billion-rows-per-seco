@@ -57,7 +57,7 @@ def test_standard_scaler():
     # Compare against sklearn
     features = ['petal_width', 'petal_length']
     skl_scaler = StandardScaler(with_mean=True, with_std=True)
-    skl_scaler.fit(ds[features])
+    skl_scaler.fit(np.array(ds[features]))
     sk_vals = skl_scaler.transform(ds[features])
     # assert
     np.testing.assert_almost_equal(sk_vals[:, 0], ds1.evaluate('standard_scaled_petal_width'),

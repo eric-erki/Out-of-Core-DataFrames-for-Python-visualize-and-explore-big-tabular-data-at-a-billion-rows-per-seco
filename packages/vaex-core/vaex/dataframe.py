@@ -43,6 +43,7 @@ except ImportError:
     from urlparse import urlparse
 
 _DEBUG = os.environ.get('VAEX_DEBUG', False)  # extra sanify checks that might hit performance
+_allow_array_casting = True
 
 DEFAULT_REPR_FORMAT = 'plain'
 FILTER_SELECTION_NAME = '__filter__'
@@ -142,6 +143,33 @@ def _hidden(meth):
     meth.__hidden__ = True
     return meth
 
+
+# implementing nep18: https://numpy.org/neps/nep-0018-array-function-protocol.html
+_nep18_method_mapping = {}  # maps from numpy function to an Expression method
+def nep18_method(numpy_function):
+    def decorator(f):
+        _nep18_method_mapping[numpy_function] = f
+        return f
+    return decorator
+
+
+# implementing nep13: https://numpy.org/neps/nep-0013-ufunc-overrides.html
+_nep13_method_mapping = {}  # maps from numpy function to an Expression method
+def nep13_method(numpy_function):
+    def decorator(f):
+        _nep13_method_mapping[numpy_function] = f
+        return f
+    return decorator
+
+
+def nep13_and_18_method(numpy_function):
+    def decorator(f):
+        _nep13_method_mapping[numpy_function] = f
+        _nep18_method_mapping[numpy_function] = f
+        return f
+    return decorator
+
+
 class DataFrame(object):
     """All local or remote datasets are encapsulated in this class, which provides a pandas
     like API to your dataset.
@@ -213,6 +241,7 @@ class DataFrame(object):
 
         # weak refs of expression that we keep to rewrite expressions
         self._expressions = []
+        self._transposed = False
 
     def __getattr__(self, name):
         # will support the hidden methods
@@ -258,7 +287,7 @@ class DataFrame(object):
         return self.is_category(column)
 
     def is_datetime(self, expression):
-        dtype = self.dtype(expression)
+        dtype = self.dtype_evaluate(expression)
         return dtype != str_type and dtype.kind == 'M'
 
     def is_category(self, column):
@@ -348,13 +377,13 @@ class DataFrame(object):
         from vaex.column import _to_string_sequence
 
         transient = self[str(expression)].transient or self.filtered or self.is_masked(expression)
-        if self.dtype(expression) == str_type and not transient:
+        if self.dtype_evaluate(expression) == str_type and not transient:
             # string is a special case, only ColumnString are not transient
             ar = self.columns[str(expression)]
             if not isinstance(ar, ColumnString):
                 transient = True
 
-        dtype = self.dtype(column)
+        dtype = self.dtype_evaluate(column)
         ordered_set_type = ordered_set_type_from_dtype(dtype, transient)
         sets = [None] * self.executor.thread_pool.nthreads
         def map(thread_index, i1, i2, ar):
@@ -386,13 +415,13 @@ class DataFrame(object):
         from vaex.column import _to_string_sequence
 
         transient = self[str(expression)].transient or self.filtered or self.is_masked(expression)
-        if self.dtype(expression) == str_type and not transient:
+        if self.dtype_evaluate(expression) == str_type and not transient:
             # string is a special case, only ColumnString are not transient
             ar = self.columns[str(expression)]
             if not isinstance(ar, ColumnString):
                 transient = True
 
-        dtype = self.dtype(column)
+        dtype = self.dtype_evaluate(column)
         index_type = index_type_from_dtype(dtype, transient)
         index_list = [None] * self.executor.thread_pool.nthreads
         def map(thread_index, i1, i2, ar):
@@ -427,7 +456,7 @@ class DataFrame(object):
         if return_inverse:
             # inverse type can be smaller, depending on length of set
             inverse = np.zeros(self._length_unfiltered, dtype=np.int64)
-            dtype = self.dtype(expression)
+            dtype = self.dtype_evaluate(expression)
             from vaex.column import _to_string_sequence
             def map(thread_index, i1, i2, ar):
                 if dtype == str_type:
@@ -1170,7 +1199,7 @@ class DataFrame(object):
         expression = _ensure_strings_from_expressions(expression)
         binby = _ensure_strings_from_expressions(binby)
         waslist, [expressions, ] = vaex.utils.listify(expression)
-        dtypes = [self.dtype(expr) for expr in expressions]
+        dtypes = [self.dtype_evaluate(expr) for expr in expressions]
         dtype0 = dtypes[0]
         if not all([k.kind == dtype0.kind for k in dtypes]):
             raise ValueError("cannot mix datetime and non-datetime expressions")
@@ -1963,8 +1992,8 @@ class DataFrame(object):
         N = self.count(selection=selection)
         extra = 0
         for column in list(self.get_column_names(virtual=virtual)):
-            dtype = self.dtype(column)
-            dtype_internal = self.dtype(column, internal=True)
+            dtype = self.dtype_evaluate(column)
+            dtype_internal = self.dtype_evaluate(column, internal=True)
             #if dtype in [str_type, str] and dtype_internal.kind == 'O':
             if isinstance(self.columns[column], ColumnString):
                 # TODO: document or fix this
@@ -1981,7 +2010,7 @@ class DataFrame(object):
         """Alias for `df.byte_size()`, see :meth:`DataFrame.byte_size`."""
         return self.byte_size()
 
-    def dtype(self, expression, internal=False):
+    def dtype_evaluate(self, expression, internal=False):
         """Return the numpy dtype for the given expression, if not a column, the first row will be evaluated to get the dtype."""
         expression = _ensure_string_from_expression(expression)
         if expression in self._dtypes_override:
@@ -2009,7 +2038,7 @@ class DataFrame(object):
     def dtypes(self):
         """Gives a Pandas series object containing all numpy dtypes of all columns (except hidden)."""
         from pandas import Series
-        return Series({column_name:self.dtype(column_name) for column_name in self.get_column_names()})
+        return Series({column_name:self.dtype_evaluate(column_name) for column_name in self.get_column_names()})
 
     def is_masked(self, column):
         '''Return if a column is a masked (numpy.ma) column.'''
@@ -2784,7 +2813,7 @@ class DataFrame(object):
 
         table = Table(meta=meta)
         for name, data in self.to_items(column_names=column_names, selection=selection, strings=strings, virtual=virtual):
-            if self.dtype(name) == str_type:  # for astropy we convert it to unicode, it seems to ignore object type
+            if self.dtype_evaluate(name) == str_type:  # for astropy we convert it to unicode, it seems to ignore object type
                 data = np.array(data).astype('U')
             meta = dict()
             if name in self.ucds:
@@ -2799,7 +2828,7 @@ class DataFrame(object):
     def to_dask_array(self, chunks="auto"):
         import dask.array as da
         import uuid
-        dtype = self._dtype
+        dtype = self.dtype
         chunks = da.core.normalize_chunks(chunks, shape=self.shape, dtype=dtype)
         name = 'vaex-df-%s' % str(uuid.uuid1())
         def getitem(df, item):
@@ -2837,7 +2866,7 @@ class DataFrame(object):
         column_position = len(self.column_names)
         if name in self.get_column_names():
             column_position = self.column_names.index(name)
-            renamed = '__' +vaex.utils.find_valid_name(name, used=self.get_column_names())
+            renamed = vaex.utils.find_valid_name('__' +name, used=self.get_column_names(hidden=True))
             self._rename(name, renamed)
 
         if isinstance(f_or_array, (np.ndarray, Column)):
@@ -3163,13 +3192,16 @@ class DataFrame(object):
         """
         type = "change" if name in self.virtual_columns else "add"
         expression = _ensure_string_from_expression(expression)
+        column_position = len(self.column_names)
         if name in self.get_column_names():
-            renamed = '__' +vaex.utils.find_valid_name(name, used=self.get_column_names())
+            column_position = self.column_names.index(name)
+            renamed = vaex.utils.find_valid_name('__' +name, used=self.get_column_names(hidden=True))
             expression = self._rename(name, renamed, expressions=[expression])[0].expression
 
         name = vaex.utils.find_valid_name(name, used=[] if not unique else self.get_column_names())
         self.virtual_columns[name] = expression
-        self.column_names.append(name)
+        if name not in self.column_names:
+            self.column_names.insert(column_position, name)
         self._save_assign_expression(name)
         self.signal_column_changed.emit(self, name, "add")
         # self.write_virtual_meta()
@@ -3263,7 +3295,7 @@ class DataFrame(object):
             parts += ["<td>%s</td>" % name]
             virtual = name not in self.column_names
             if name in self.column_names:
-                dtype = str(self.dtype(name)) if self.dtype(name) != str else 'str'
+                dtype = str(self.dtype_evaluate(name)) if self.dtype_evaluate(name) != str else 'str'
             else:
                 dtype = "</i>virtual column</i>"
             parts += ["<td>%s</td>" % dtype]
@@ -3292,7 +3324,7 @@ class DataFrame(object):
             for name in variable_names:
                 parts += ["<tr>"]
                 parts += ["<td>%s</td>" % name]
-                type = self.dtype(name).name
+                type = self.dtype_evaluate(name).name
                 parts += ["<td>%s</td>" % type]
                 units = self.unit(name)
                 units = units.to_string("latex_inline") if units else ""
@@ -3361,13 +3393,13 @@ class DataFrame(object):
         N = len(self)
         columns = {}
         for feature in self.get_column_names(strings=strings, virtual=virtual)[:]:
-            dtype = str(self.dtype(feature)) if self.dtype(feature) != str else 'str'
-            if self.dtype(feature) == str_type or self.dtype(feature).kind in ['S', 'U']:
+            dtype = str(self.dtype_evaluate(feature)) if self.dtype_evaluate(feature) != str else 'str'
+            if self.dtype_evaluate(feature) == str_type or self.dtype_evaluate(feature).kind in ['S', 'U']:
                 count = self.count(feature, selection=selection, delay=True)
                 self.execute()
                 count = count.get()
                 columns[feature] = ((dtype, count, N-count, '--', '--', '--', '--'))
-            elif self.dtype(feature).kind == 'O':
+            elif self.dtype_evaluate(feature).kind == 'O':
                 # this will also properly count NaN-like objects like NaT
                 count_na = self[feature].isna().astype('int').sum(delay=True)
                 self.execute()
@@ -3603,7 +3635,7 @@ class DataFrame(object):
                 return False
             if not virtual and name in self.virtual_columns:
                 return False
-            if not strings and (self.dtype(name) == str_type or self.dtype(name).type == np.string_):
+            if not strings and (self.dtype_evaluate(name) == str_type or self.dtype_evaluate(name).type == np.string_):
                 return False
             if not hidden and name.startswith('__'):
                 return False
@@ -4310,7 +4342,7 @@ class DataFrame(object):
         """Returns True if there is a selection with the given name."""
         return self.get_selection(name) is not None
 
-    def __setitem__(self, name, value):
+    def __setitem__(self, item, value):
         '''Convenient way to add a virtual column / expression to this DataFrame.
 
         Example:
@@ -4322,13 +4354,18 @@ class DataFrame(object):
         <vaex.expression.Expression(expressions='r')> instance at 0x121687e80 values=[2.9655450396553587, 5.77829281049018, 6.99079603950256, 9.431842752707537, 0.8825613121347967 ... (total 330000 values) ... 7.453831761514681, 15.398412491068198, 8.864250273925633, 17.601047186042507, 14.540181524970293]
         '''
 
-        if isinstance(name, six.string_types):
+        if isinstance(item, six.string_types):
             if isinstance(value, Expression):
                 value = value.expression
             if isinstance(value, (np.ndarray, Column)):
-                self.add_column(name, value)
+                self.add_column(item, value)
             else:
-                self.add_virtual_column(name, value)
+                self.add_virtual_column(item, value)
+        elif isinstance(item, tuple):
+            assert len(item) == 2 and isinstance(item[0], slice), 'can only set using df[:,0] or df[:,\'name\'] syntax'
+            if isinstance(item[1], int):
+                name = self.get_column_names()[item[1]]
+            self[name] = value
         else:
             raise TypeError('__setitem__ only takes strings as arguments, not {}'.format(type(name)))
 
@@ -4481,7 +4518,13 @@ class DataFrame(object):
 
     def __iter__(self):
         """Iterator over the column names."""
-        return iter(list(self.get_column_names()))
+        if self._transposed:
+            for name in self.get_column_names():
+                yield self[name]
+        else:
+            # TODO: we should iterate over rows, this would be breaking though
+            for name in self.get_column_names():
+                yield name
 
     def _root_nodes(self):
         """Returns a list of string which are the virtual columns that are not used in any other virtual column."""
@@ -4767,15 +4810,126 @@ class DataFrameLocal(DataFrame):
     def echo(self, arg): return arg
 
     @property
-    def _dtype(self):
+    def shape(self):
+        if self._transposed:
+            return (len(self.get_column_names()), len(self))
+        else:
+            return (len(self), len(self.get_column_names()))
+
+    @property
+    def T(self):
+        df = self.copy()
+        df._transposed = not self._transposed
+        return df
+
+    @property
+    def dtype(self):
         dtypes = [self[k].dtype for k in self.get_column_names()]
-        if not all([dtypes[0] == dtype for dtype in dtypes]):
-            return ValueError("Not all dtypes are equal: %r" % dtypes)
+        assert all([dtypes[0] == dtype for dtype in dtypes])
         return dtypes[0]
 
     @property
-    def shape(self):
-        return (len(self), len(self.get_column_names()))
+    def ndim(self):
+        return 2
+
+    def __invert__(self):
+        return np.invert(self)  # dispatch to __array_function or __array_ufunc__
+
+    def __array_function__(self, func, types, args, kwargs):
+        method = _nep18_method_mapping.get(func)
+        if method is None:
+            def dispatch_to_expression(name):
+                expression = self[name]
+                forward_args = (expression,) + args[1:]
+                return expression.__array_function__(func, types, forward_args, kwargs)
+
+            results = [dispatch_to_expression(name) for name in self.get_column_names()]
+            if any([k is NotImplemented for k in results]):
+                raise TypeError("no implementation found for %r on types that implement __array_function__: %r" % (func, types))
+            if isinstance(results[0], Expression):
+                # ufunc case etc
+                df = self.copy()
+                for i, name in enumerate(self.get_column_names()):
+                    df[name] = results[i]
+                return df
+            else:
+                # aggregrates
+                return np.array(results)
+            # return NotImplemented
+        assert args[0] is self
+        result = method(*args, **kwargs)
+        return result
+
+
+    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+        method = _nep13_method_mapping.get(ufunc)
+        if method is None:
+            assert inputs[0] is self
+            def dispatch_to_expression(name, i):
+                expression = self[name]
+                forward_args = (expression,) + inputs[1:]
+                if len(forward_args) > 1 and isinstance(forward_args[1], np.ndarray):
+                    ar = inputs[1]
+                    if len(ar) == len(self.get_column_names()):  # poor man's broadcasting
+                        forward_args = (forward_args[0],) + (forward_args[1][i], ) + forward_args[2:]
+                return expression.__array_ufunc__(ufunc, method, *forward_args, **kwargs)
+
+            results = [dispatch_to_expression(name, i) for i, name in enumerate(self.get_column_names())]
+            if any([k is NotImplemented for k in results]):
+                raise TypeError("no implementation found for %r on types that implement __array_ufunc__: %r" % (ufunc, method))
+            if isinstance(results[0], Expression):
+                df = self.copy()
+                for i, name in enumerate(self.get_column_names()):
+                    df[name] = results[i]
+                return df
+            else:
+                return np.array(results)
+            return NotImplemented
+        if len(inputs) > 1 and inputs[1] is self:
+            assert len(inputs) == 2  # TODO: check if arguments can be swapped? how?
+            inputs = inputs[::-1]
+        if inputs[0] is not self:
+            return NotImplemented
+        # assert inputs[0] is self or inputs[1] is self
+        return method(*inputs, **kwargs)
+
+    @nep18_method(np.dot)
+    def _dot(self, b):
+        b = np.asarray(b)
+        assert b.ndim == 2
+        N = b.shape[1]
+        df = self.copy()
+        names = df.get_column_names()
+        output_names = ['c'+str(i) for i in range(N)]
+        columns = [df[names[j]] for j in range(b.shape[0])]
+        for name in names:
+            df._hide_column(name)
+        for i in range(N):
+            df[output_names[i]] = sum([columns[j] * b[j,i] for j in range(b.shape[0])])
+        return df
+
+    @nep18_method(np.may_share_memory)
+    def _may_share_memory(self, b):
+        return True  # be conservative
+
+    @nep18_method(np.linalg.svd)
+    def _np_linalg_svd(self, full_matrices=True):
+        import dask.array as da
+        import dask
+        X = self.to_dask_array()
+        # TODO: we ignore full_matrices
+        u, s, v = da.linalg.svd(X)#, full_matrices=full_matrices)
+        u, s, v = dask.compute(u, s, v)
+        return u, s, v
+
+    @nep18_method(np.linalg.qr)
+    def _np_linalg_qr(self):
+        import dask.array as da
+        import dask
+        X = self.to_dask_array()
+        result = da.linalg.qr(X)
+        result = dask.compute(*result)
+        return result
 
     def __array__(self, dtype=None):
         """Gives a full memory copy of the DataFrame into a 2d numpy array of shape (n_rows, n_columns).
@@ -4787,13 +4941,15 @@ class DataFrameLocal(DataFrame):
 
         If any of the columns contain masked arrays, the masks are ignored (i.e. the masked elements are returned as well).
         """
+        if not _allow_array_casting:
+            raise RuntimeError('casting a dataframe to an array is explicitly disabled')
         if dtype is None:
             dtype = np.float64
         chunks = []
-        for name in self.get_column_names(strings=False):
-            if not np.can_cast(self.dtype(name), dtype):
-                if self.dtype(name) != dtype:
-                    raise ValueError("Cannot cast %r (of type %r) to %r" % (name, self.dtype(name), dtype))
+        for name in self.get_column_names():
+            if not np.can_cast(self.dtype_evaluate(name), dtype):
+                if self.dtype_evaluate(name) != dtype:
+                    raise ValueError("Cannot cast %r (of type %r) to %r" % (name, self.dtype_evaluate(name), dtype))
             else:
                 chunks.append(self.evaluate(name))
         return np.array(chunks, dtype=dtype).T
@@ -4953,14 +5109,14 @@ class DataFrameLocal(DataFrame):
                 if unit1 != unit2:
                     print("unit mismatch : %r vs %r for %s" % (unit1, unit2, column_name))
                     meta_mismatch.append(column_name)
-                type1 = self.dtype(column_name)
+                type1 = self.dtype_evaluate(column_name)
                 if type1 != str_type:
                     type1 = type1.type
-                type2 = other.dtype(column_name)
+                type2 = other.dtype_evaluate(column_name)
                 if type2 != str_type:
                     type2 = type2.type
                 if type1 != type2:
-                    print("different dtypes: %s vs %s for %s" % (self.dtype(column_name), other.dtype(column_name), column_name))
+                    print("different dtypes: %s vs %s for %s" % (self.dtype_evaluate(column_name), other.dtype_evaluate(column_name), column_name))
                     type_mismatch.append(column_name)
                 else:
                     # a = self.columns[column_name]
@@ -4998,7 +5154,7 @@ class DataFrameLocal(DataFrame):
                         a = normalize(a)
                         b = normalize(b)
                         boolean_mask = (a == b)
-                        if self.dtype(column_name) != str_type and self.dtype(column_name).kind == 'f':  # floats with nan won't equal itself, i.e. NaN != NaN
+                        if self.dtype_evaluate(column_name) != str_type and self.dtype_evaluate(column_name).kind == 'f':  # floats with nan won't equal itself, i.e. NaN != NaN
                             boolean_mask |= (np.isnan(a) & np.isnan(b))
                         return boolean_mask
                     boolean_mask = equal_mask(a, b)
@@ -5098,7 +5254,7 @@ class DataFrameLocal(DataFrame):
             index = right._index(right_on)
             lookup = np.zeros(left._length_original, dtype=np.int64)
             lookup_extra_chunks = []
-            dtype = left.dtype(left_on)
+            dtype = left.dtype_evaluate(left_on)
             duplicates_right = index.has_duplicates
 
             if duplicates_right and not allow_duplication:
@@ -5260,7 +5416,7 @@ class DataFrameLocal(DataFrame):
               self.columns[column_name].dtype.type == np.float64 and
               self.columns[column_name].strides[0] == 8 and
               column_name not in
-              self.virtual_columns) or self.dtype(column_name) == str_type or self.dtype(column_name).kind == 'S')
+              self.virtual_columns) or self.dtype_evaluate(column_name) == str_type or self.dtype_evaluate(column_name).kind == 'S')
         # and False:
 
     def selected_length(self, selection="default"):
@@ -5397,12 +5553,12 @@ class DataFrameLocal(DataFrame):
             return grid
 
     def _binner_scalar(self, expression, limits, shape):
-        type = vaex.utils.find_type_from_dtype(vaex.superagg, "BinnerScalar_", self.dtype(expression))
+        type = vaex.utils.find_type_from_dtype(vaex.superagg, "BinnerScalar_", self.dtype_evaluate(expression))
         vmin, vmax = limits
         return type(expression, vmin, vmax, shape)
 
     def _binner_ordinal(self, expression, ordinal_count, min_value=0):
-        type = vaex.utils.find_type_from_dtype(vaex.superagg, "BinnerOrdinal_", self.dtype(expression))
+        type = vaex.utils.find_type_from_dtype(vaex.superagg, "BinnerOrdinal_", self.dtype_evaluate(expression))
         return type(expression, ordinal_count, min_value)
 
     def _create_grid(self, binby, limits, shape, delay=False):

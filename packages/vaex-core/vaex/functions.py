@@ -2099,6 +2099,9 @@ def _astype(x, dtype):
         x = x.astype(dtype).astype('O')
         x[mask] = None
         return _to_string_column(x)
+    if dtype == 'datetime64':
+        if vaex.column._is_stringy(x):
+            x = x.to_numpy()
     return x.astype(dtype)
 
 

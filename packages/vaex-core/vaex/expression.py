@@ -227,7 +227,7 @@ class Expression(with_metaclass(Meta)):
 
     @property
     def dtype(self):
-        return self.ds.dtype(self.expression)
+        return self.ds.dtype_evaluate(self.expression)
 
     @property
     def shape(self):

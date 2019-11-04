@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import sys
 import re
+import tempfile
 
 import vaex
 import numpy as np
@@ -380,3 +381,14 @@ def test_masked_string():
 	s = np.ma.MaskedArray(data=['dog', 'dog', 'cat', 'cat', 'mouse'], mask=[False, False, True, False, True])
 	df = vaex.from_arrays(s=s)
 	assert (df.s == 'cat').tolist() == [False, False, False, True, False]
+
+def test_string_operations_from_mmap_file():
+	x = np.arange(5)
+	y = np.array(['This', 'is', 'a', None, 'test'])
+	df = vaex.from_arrays(x=x, y=y)
+
+	filename = tempfile.mktemp()
+	df.export_hdf5(filename)
+
+	df_from_file = vaex.open(filename)
+	assert df_from_file.y.str.slice(start=0, stop=2).tolist() == ['Th', 'is', 'a', None, 'te']
